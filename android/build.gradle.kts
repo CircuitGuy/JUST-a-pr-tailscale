@@ -52,7 +52,12 @@ android {
   namespace = "com.tailscale.ipn"
 
   buildTypes {
-    debug { manifestPlaceholders["leanbackRequired"] = isTV() }
+    debug {
+      manifestPlaceholders["leanbackRequired"] = isTV()
+      // Install alongside the release app (com.tailscale.ipn) for side-by-side testing.
+      applicationIdSuffix = ".netbounce"
+      versionNameSuffix = "-netbounce"
+    }
 
     release {
       manifestPlaceholders["leanbackRequired"] = isTV()

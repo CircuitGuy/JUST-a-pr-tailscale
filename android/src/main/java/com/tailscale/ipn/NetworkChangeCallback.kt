@@ -7,7 +7,11 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import com.tailscale.ipn.ui.model.Ipn
+import com.tailscale.ipn.ui.notifier.Notifier
 import com.tailscale.ipn.util.TSLog
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -62,6 +66,51 @@ object NetworkChangeCallback {
     private set
 
   @Volatile private var underlyingNetworkListener: ((Network?) -> Unit)? = null
+
+  // How long to wait for the default network to settle before bouncing the VPN.
+  // Network switches arrive as a burst of callbacks (onLost, onCapabilitiesChanged,
+  // onLinkPropertiesChanged), so each new switch resets this timer.
+  private const val BOUNCE_DEBOUNCE_MS = 3000L
+
+  private val bounceHandler by lazy { Handler(Looper.getMainLooper()) }
+
+  // The last non-null default network. Used to detect a real switch between
+  // underlying networks (e.g. wifi -> cellular), as opposed to the initial
+  // network discovery at startup or a transient loss of all networks.
+  private var lastNonNullDefaultNetwork: Network? = null
+
+  private val bounceRunnable = Runnable {
+    val current = cachedDefaultNetwork
+    val state = Notifier.state.value
+    if (current == null) {
+      TSLog.d(TAG, "netbounce: no default network; skipping VPN bounce")
+      return@Runnable
+    }
+    if (state != Ipn.State.Running) {
+      TSLog.d(TAG, "netbounce: state=$state (not Running); skipping VPN bounce")
+      return@Runnable
+    }
+    TSLog.d(TAG, "netbounce: default network settled on $current; bouncing VPN")
+    UninitializedApp.get().restartVPN()
+  }
+
+  // Work around https://github.com/tailscale/tailscale/issues/17747: after the
+  // underlying network changes (e.g. wifi -> cellular), DNS and tailnet
+  // connectivity can stay broken until the user disconnects and reconnects.
+  // Do that reconnect automatically once the new network has settled.
+  private fun maybeScheduleBounceLocked(newNetwork: Network?) {
+    if (newNetwork == null) {
+      return
+    }
+    val previous = lastNonNullDefaultNetwork
+    lastNonNullDefaultNetwork = newNetwork
+    if (previous == null || previous == newNetwork) {
+      return
+    }
+    TSLog.d(TAG, "netbounce: default network changed $previous -> $newNetwork; scheduling bounce")
+    bounceHandler.removeCallbacks(bounceRunnable)
+    bounceHandler.postDelayed(bounceRunnable, BOUNCE_DEBOUNCE_MS)
+  }
 
   fun setUnderlyingNetworkListener(listener: ((Network?) -> Unit)?) {
     underlyingNetworkListener = listener
@@ -190,6 +239,7 @@ object NetworkChangeCallback {
 
     if (newNetwork != oldNetwork) {
       underlyingNetworkListener?.invoke(newNetwork)
+      maybeScheduleBounceLocked(newNetwork)
       return true
     }
 
